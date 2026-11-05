@@ -76,6 +76,14 @@ properties = {
     value      : true,
     scope      : "post"
   },
+  m19DuringG30: {
+    title      : "M19 during G30",
+    description: "Start asynchronous spindle orientation (M19 P0) after M5, ahead of the next tool-change G30. Only when the previous operation is safely at its programmed clearance Z. Requires the updated XARM M6 spindle-hold logic. Disable for original behavior.",
+    group      : "preferences",
+    type       : "boolean",
+    value      : false,
+    scope      : "post"
+  },
   showSequenceNumbers: {
     title      : "Use sequence numbers",
     description: "'Yes' outputs sequence numbers on each block, 'Only on tool change' outputs sequence numbers on tool change blocks only, and 'No' disables the output of sequence numbers.",
@@ -1729,6 +1737,57 @@ function executeManualNC(command) {
   }
 }
 
+/**
+  Optional XARM issue #13 optimization: overlap M19 orientation with the NEXT
+  tool-change G30.  The M6 remap in XARM commit 04b8ae6 preserves an existing
+  orient hold rather than sending an unconditional M5.
+
+  M19 is only safe after the previous operation has retracted clear of the
+  workpiece. Skip (with a warning) if CAM does not provide a numeric clearance
+  plane or if the operation finishes below it. Do not invent a Z move.
+*/
+function canOrientDuringG30() {
+  if (!getProperty("m19DuringG30") ||
+      !getProperty("useM06") ||
+      getProperty("safePositionMethod") != "G30" ||
+      isLastSection()) {
+    return false;
+  }
+
+  var nextSection = getNextSection();
+  var nextTool = nextSection.getTool();
+  if (tool.number == nextTool.number ||
+      tool.manualToolChange || nextTool.manualToolChange ||
+      tool.type == TOOL_PROBE || nextTool.type == TOOL_PROBE ||
+      currentSection.isOptional() || nextSection.isOptional() ||
+      currentSection.isMultiAxis() || nextSection.isMultiAxis()) {
+    return false;
+  }
+
+  // Restrict the early orient to a Z-aligned spindle and a known safe height.
+  var axis = currentSection.getGlobalFinalToolAxis();
+  if (Math.abs(axis.x) > 0.0001 || Math.abs(axis.y) > 0.0001 || axis.z < 0.9999) {
+    return false;
+  }
+
+  var clearanceZ = getParameter("operation:clearanceHeight_value", undefined);
+  if (typeof clearanceZ != "number") {
+    clearanceZ = getParameter("operation:clearanceHeight", undefined);
+  }
+  if (typeof clearanceZ != "number" || !isFinite(clearanceZ)) {
+    warning("M19 during G30 skipped: previous operation clearance Z is unavailable.");
+    return false;
+  }
+
+  var endZ = getCurrentPosition().z;
+  if (typeof endZ != "number" || !isFinite(endZ) ||
+      endZ + toPreciseUnit(0.005, MM) < clearanceZ) {
+    warning("M19 during G30 skipped: previous operation has not reached clearance Z.");
+    return false;
+  }
+  return true;
+}
+
 function onSectionEnd() {
   writeBlock(gPlaneModal.format(17));
 
@@ -1753,6 +1812,11 @@ function onSectionEnd() {
   if ((((getCurrentSectionId() + 1) >= getNumberOfSections()) ||
     (tool.number != getNextSection().getTool().number)) && !toolChecked) {
     prepareForToolCheck();
+    // M5/coolant off above, M19 P0 now, then next section's G30/Z retract.
+    // No early M19 at the program end or when the toggle is disabled.
+    if (canOrientDuringG30()) {
+      writeBlock(mFormat.format(19), "P0");
+    }
   }
 }
 
